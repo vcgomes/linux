@@ -2810,19 +2810,26 @@ static int refill_sheaf(struct kmem_cache *s, struct slab_sheaf *sheaf,
 			 gfp_t gfp)
 {
 	int to_fill = s->sheaf_capacity - sheaf->size;
+	int min_fill;
 	int filled;
 
 	if (!to_fill)
 		return 0;
 
-	filled = refill_objects(s, &sheaf->objects[sheaf->size], gfp, to_fill,
+	/*
+	 * Accept a partial refill: this increases warm-stash hit rate and
+	 * reduces the number of cold partial-list slab walks per refill event,
+	 * at the cost of more frequent (but cheaper) refills.
+	 */
+	min_fill = max(1, to_fill / 2);
+	filled = refill_objects(s, &sheaf->objects[sheaf->size], gfp, min_fill,
 				to_fill);
 
 	sheaf->size += filled;
 
 	stat_add(s, SHEAF_REFILL, filled);
 
-	if (filled < to_fill)
+	if (filled < min_fill)
 		return -ENOMEM;
 
 	return 0;
