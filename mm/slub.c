@@ -422,6 +422,8 @@ struct slub_percpu_sheaves {
 	struct slab_sheaf *main; /* never NULL when unlocked */
 	struct slab_sheaf *spare; /* empty or full, may be NULL */
 	struct slab_sheaf *rcu_free; /* for batching kfree_rcu() */
+	struct slab *warm_slab;	/* partially-drained warm slab stash */
+	void *warm_freelist;	/* head of remaining free objects in warm_slab */
 };
 
 /*
@@ -2966,6 +2968,27 @@ static void rcu_free_sheaf_nobarn(struct rcu_head *head)
 	free_empty_sheaf(s, sheaf);
 }
 
+static void __slab_free(struct kmem_cache *s, struct slab *slab,
+			void *head, void *tail, int cnt, unsigned long addr);
+
+/*
+ * Walk a freelist chain starting at head to find the tail and count, then
+ * return the entire chain to its slab via __slab_free().
+ */
+static void return_freelist_to_slab(struct kmem_cache *s, struct slab *slab,
+				    void *head, unsigned long addr)
+{
+	void *object = head, *tail;
+	int cnt = 0;
+
+	do {
+		tail = object;
+		cnt++;
+		object = get_freepointer(s, object);
+	} while (object);
+	__slab_free(s, slab, head, tail, cnt, addr);
+}
+
 /*
  * Caller needs to make sure migration is disabled in order to fully flush
  * single cpu's sheaves
@@ -2979,6 +3002,8 @@ static void pcs_flush_all(struct kmem_cache *s)
 {
 	struct slub_percpu_sheaves *pcs;
 	struct slab_sheaf *spare, *rcu_free;
+	struct slab *warm_slab;
+	void *warm_freelist;
 
 	local_lock(&s->cpu_sheaves->lock);
 	pcs = this_cpu_ptr(s->cpu_sheaves);
@@ -2989,6 +3014,11 @@ static void pcs_flush_all(struct kmem_cache *s)
 	rcu_free = pcs->rcu_free;
 	pcs->rcu_free = NULL;
 
+	warm_slab = pcs->warm_slab;
+	warm_freelist = pcs->warm_freelist;
+	WRITE_ONCE(pcs->warm_slab, NULL);
+	pcs->warm_freelist = NULL;
+
 	local_unlock(&s->cpu_sheaves->lock);
 
 	if (spare) {
@@ -2998,6 +3028,9 @@ static void pcs_flush_all(struct kmem_cache *s)
 
 	if (rcu_free)
 		call_rcu(&rcu_free->rcu_head, rcu_free_sheaf_nobarn);
+
+	if (warm_slab)
+		return_freelist_to_slab(s, warm_slab, warm_freelist, _RET_IP_);
 
 	sheaf_flush_main(s);
 }
@@ -3019,6 +3052,13 @@ static void __pcs_flush_all_cpu(struct kmem_cache *s, unsigned int cpu)
 	if (pcs->rcu_free) {
 		call_rcu(&pcs->rcu_free->rcu_head, rcu_free_sheaf_nobarn);
 		pcs->rcu_free = NULL;
+	}
+
+	if (pcs->warm_slab) {
+		return_freelist_to_slab(s, pcs->warm_slab, pcs->warm_freelist,
+					_RET_IP_);
+		WRITE_ONCE(pcs->warm_slab, NULL);
+		pcs->warm_freelist = NULL;
 	}
 }
 
@@ -3057,6 +3097,7 @@ static void pcs_destroy(struct kmem_cache *s)
 
 		WARN_ON(pcs->spare);
 		WARN_ON(pcs->rcu_free);
+		WARN_ON(pcs->warm_slab);
 
 		if (!WARN_ON(pcs->main->size)) {
 			free_empty_sheaf(s, pcs->main);
@@ -7085,6 +7126,84 @@ void kmem_cache_free_bulk(struct kmem_cache *s, size_t size, void **p)
 }
 EXPORT_SYMBOL(kmem_cache_free_bulk);
 
+/*
+ * Walk a freelist chain, placing up to @max objects into @p[] and wiping their
+ * freepointer fields before handing them to the allocator. On return, *@objectp
+ * is NULL if the freelist was exhausted, or the head of the remaining chain if
+ * @max was reached first. Returns the number of objects placed in @p[].
+ */
+static unsigned int drain_freelist_to_array(struct kmem_cache *s, void **objectp,
+					    void **p, unsigned int max)
+{
+	void *object = *objectp;
+	unsigned int n = 0;
+
+	while (object && n < max) {
+		p[n] = object;
+		object = get_freepointer(s, object);
+		maybe_wipe_obj_freeptr(s, p[n]);
+		n++;
+	}
+	*objectp = object;
+	return n;
+}
+
+/*
+ * Try to drain objects from the per-CPU warm slab stash into p[].
+ *
+ * The warm stash holds a slab with excess free objects that were claimed by
+ * get_freelist_nofreeze() but could not fit in p[] during a previous refill.
+ * Rather than returning the slab to the node partial list (which requires
+ * taking the per-node kmem_cache_node->list_lock), we stash it here so the
+ * next refill can serve objects directly from the warm freelist chain.
+ *
+ * Returns the number of objects placed in p[].
+ */
+static unsigned int
+drain_warm_slab(struct kmem_cache *s, void **p, unsigned int max)
+{
+	struct slub_percpu_sheaves *pcs;
+	struct slab *warm_slab;
+	void *object;
+	unsigned int refilled = 0;
+
+	/*
+	 * Speculative check before taking the lock: this_cpu_ptr() may return
+	 * stale data if the task migrates, but the lock-protected re-check
+	 * below handles that.
+	 */
+	pcs = this_cpu_ptr(s->cpu_sheaves);
+	if (!data_race(pcs->warm_slab))
+		return 0;
+
+	if (!local_trylock(&s->cpu_sheaves->lock))
+		return 0;
+
+	pcs = this_cpu_ptr(s->cpu_sheaves);
+	warm_slab = pcs->warm_slab;
+	if (!warm_slab) {
+		local_unlock(&s->cpu_sheaves->lock);
+		return 0;
+	}
+
+	/* Claim the stash; release lock before walking the freelist */
+	object = pcs->warm_freelist;
+	WRITE_ONCE(pcs->warm_slab, NULL);
+	pcs->warm_freelist = NULL;
+	local_unlock(&s->cpu_sheaves->lock);
+
+	refilled = drain_freelist_to_array(s, &object, p, max);
+
+	/*
+	 * If we still have leftover objects, free them back to the slab.
+	 * This happens when max < stash count (partial refill via min_fill).
+	 */
+	if (unlikely(object))
+		return_freelist_to_slab(s, warm_slab, object, _RET_IP_);
+
+	return refilled;
+}
+
 static unsigned int
 __refill_objects_node(struct kmem_cache *s, void **p, gfp_t gfp, unsigned int min,
 		      unsigned int max, struct kmem_cache_node *n,
@@ -7109,30 +7228,30 @@ __refill_objects_node(struct kmem_cache *s, void **p, gfp_t gfp, unsigned int mi
 
 		object = get_freelist_nofreeze(s, slab);
 
-		while (object && refilled < max) {
-			p[refilled] = object;
-			object = get_freepointer(s, object);
-			maybe_wipe_obj_freeptr(s, p[refilled]);
-
-			refilled++;
-		}
+		refilled += drain_freelist_to_array(s, &object, p + refilled,
+						    max - refilled);
 
 		/*
-		 * Freelist had more objects than we can accommodate, we need to
-		 * free them back. We can treat it like a detached freelist, just
-		 * need to find the tail object.
+		 * Freelist had more objects than we can accommodate. Try to
+		 * stash the slab on the current CPU so the next refill can use
+		 * it directly, avoiding another cold partial-list walk.
+		 * Fall back to freeing back to the slab if the stash is full.
 		 */
 		if (unlikely(object)) {
-			void *head = object;
-			void *tail;
-			int cnt = 0;
+			if (local_trylock(&s->cpu_sheaves->lock)) {
+				struct slub_percpu_sheaves *pcs;
 
-			do {
-				tail = object;
-				cnt++;
-				object = get_freepointer(s, object);
-			} while (object);
-			__slab_free(s, slab, head, tail, cnt, _RET_IP_);
+				pcs = this_cpu_ptr(s->cpu_sheaves);
+				if (!pcs->warm_slab) {
+					WRITE_ONCE(pcs->warm_slab, slab);
+					pcs->warm_freelist = object;
+					object = NULL;
+				}
+				local_unlock(&s->cpu_sheaves->lock);
+			}
+
+			if (object)
+				return_freelist_to_slab(s, slab, object, _RET_IP_);
 		}
 
 		if (refilled >= max)
@@ -7235,9 +7354,21 @@ refill_objects(struct kmem_cache *s, void **p, gfp_t gfp, unsigned int min,
 	if (WARN_ON_ONCE(!gfpflags_allow_spinning(gfp)))
 		return 0;
 
-	refilled = __refill_objects_node(s, p, gfp, min, max,
-					 get_node(s, local_node),
-					 /* allow_spin = */ true);
+	/*
+	 * Serve objects stashed by a previous refill before walking the partial
+	 * list. This is the only site where drain_warm_slab() is needed: if the
+	 * local-node walk below stashes a slab it fills the array to max, so
+	 * refill_objects() returns before reaching __refill_objects_any(), and
+	 * the stash is always empty on entry there.
+	 */
+	refilled = drain_warm_slab(s, p, max);
+	if (refilled >= min)
+		return refilled;
+
+	refilled += __refill_objects_node(s, p + refilled, gfp, min - refilled,
+					  max - refilled,
+					  get_node(s, local_node),
+					  /* allow_spin = */ true);
 	if (refilled >= min)
 		return refilled;
 
