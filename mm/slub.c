@@ -2989,9 +2989,13 @@ static void return_freelist_to_slab(struct kmem_cache *s, struct slab *slab,
 	int cnt = 0;
 
 	do {
+		void *next = get_freepointer(s, object);
+
+		if (next)
+			prefetch(next);
 		tail = object;
 		cnt++;
-		object = get_freepointer(s, object);
+		object = next;
 	} while (object);
 	__slab_free(s, slab, head, tail, cnt, addr);
 }
@@ -7146,10 +7150,14 @@ static unsigned int drain_freelist_to_array(struct kmem_cache *s, void **objectp
 	unsigned int n = 0;
 
 	while (object && n < max) {
+		void *next = get_freepointer(s, object);
+
+		if (next)
+			prefetch(next);
 		p[n] = object;
-		object = get_freepointer(s, object);
 		maybe_wipe_obj_freeptr(s, p[n]);
 		n++;
+		object = next;
 	}
 	*objectp = object;
 	return n;
