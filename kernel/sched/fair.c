@@ -7582,6 +7582,44 @@ static int wake_wide(struct task_struct *p)
 }
 
 /*
+ * Iterate over the LLCs, if the current one is busier than the
+ * average, decline waking a sync task here.
+ */
+static bool sched_llc_over_share(int cpu)
+{
+	struct sched_domain *numa;
+	struct sched_domain_shared *sds;
+	int this_busy, total_busy = 0, nr_llc = 0;
+	int scpu;
+
+	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	if (!sds)
+		return false;
+	this_busy = atomic_read(&sds->nr_busy_cpus);
+
+	numa = rcu_dereference_all(per_cpu(sd_numa, cpu));
+	if (!numa)
+		return false;
+
+	for_each_cpu(scpu, sched_domain_span(numa)) {
+		struct sched_domain_shared *ssds;
+
+		if (scpu != per_cpu(sd_llc_id, scpu))
+			continue;
+
+		ssds = rcu_dereference_all(per_cpu(sd_llc_shared, scpu));
+		if (ssds)
+			total_busy += atomic_read(&ssds->nr_busy_cpus);
+		nr_llc++;
+	}
+
+	if (nr_llc <= 1)
+		return false;
+
+	return this_busy * nr_llc > total_busy;
+}
+
+/*
  * The purpose of wake_affine() is to quickly determine on which CPU we can run
  * soonest. For the purpose of speed we only consider the waking and previous
  * CPU.
@@ -7614,7 +7652,8 @@ wake_affine_idle(int this_cpu, int prev_cpu, int sync)
 	if (sync) {
 		struct rq *rq = cpu_rq(this_cpu);
 
-		if ((rq->nr_running - cfs_h_nr_delayed(rq)) == 1)
+		if ((rq->nr_running - cfs_h_nr_delayed(rq)) == 1 &&
+		    !sched_llc_over_share(this_cpu))
 			return this_cpu;
 	}
 
