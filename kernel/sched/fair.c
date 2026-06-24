@@ -7582,6 +7582,42 @@ static int wake_wide(struct task_struct *p)
 }
 
 /*
+ * True when @cpu's LLC carries more busy CPUs than the scheduler's own NUMA
+ * imbalance tolerance allows, i.e. the load balancer would itself consider
+ * this LLC over its fair share and try to spread work off it.
+ *
+ * The tolerance is imb_numa_nr, which the topology code precomputes (see
+ * adjust_numa_imbalance()). We read it off the lowest NUMA domain (sd_numa),
+ * where it is stored unscaled -- the per-node/per-LLC tolerance -- rather
+ * than off llc->parent (the NODE domain), whose imb_numa_nr is scaled up by
+ * the domain's span and so only coincidentally matched one LLC's share on
+ * the SNC test box. Reading the precomputed value keeps this in lockstep
+ * with the topology's own imbalance policy instead of re-deriving it here.
+ * nr_busy_cpus on the LLC's shared domain is the pre-maintained busy-CPU
+ * count for it.
+ *
+ * sd_numa is NULL on single-node systems, where there is nowhere better to
+ * spread to, so this only engages on multi-node systems.
+ */
+static bool sched_numa_over_share(int cpu)
+{
+	struct sched_domain_shared *sds;
+	struct sched_domain *numa;
+	int this_busy;
+
+	numa = rcu_dereference_all(per_cpu(sd_numa, cpu));
+	if (!numa)
+		return false;
+
+	sds = rcu_dereference_all(per_cpu(sd_llc_shared, cpu));
+	if (!sds)
+		return false;
+	this_busy = atomic_read(&sds->nr_busy_cpus);
+
+	return this_busy > numa->imb_numa_nr;
+}
+
+/*
  * The purpose of wake_affine() is to quickly determine on which CPU we can run
  * soonest. For the purpose of speed we only consider the waking and previous
  * CPU.
@@ -7614,7 +7650,8 @@ wake_affine_idle(int this_cpu, int prev_cpu, int sync)
 	if (sync) {
 		struct rq *rq = cpu_rq(this_cpu);
 
-		if ((rq->nr_running - cfs_h_nr_delayed(rq)) == 1)
+		if ((rq->nr_running - cfs_h_nr_delayed(rq)) == 1 &&
+		    !sched_numa_over_share(this_cpu))
 			return this_cpu;
 	}
 
@@ -7633,7 +7670,7 @@ wake_affine_weight(struct sched_domain *sd, struct task_struct *p,
 
 	this_eff_load = cpu_load(cpu_rq(this_cpu));
 
-	if (sync) {
+	if (sync && !sched_numa_over_share(this_cpu)) {
 		unsigned long current_load = task_h_load(current);
 
 		if (current_load > this_eff_load)
