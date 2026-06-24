@@ -7672,7 +7672,7 @@ wake_affine_weight(struct sched_domain *sd, struct task_struct *p,
 
 	this_eff_load = cpu_load(cpu_rq(this_cpu));
 
-	if (sync) {
+	if (sync && !sched_llc_over_share(this_cpu)) {
 		unsigned long current_load = task_h_load(current);
 
 		if (current_load > this_eff_load)
